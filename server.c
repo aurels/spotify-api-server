@@ -328,6 +328,44 @@ static void get_user_playlists(sp_playlistcontainer *pc,
                   json);
 }
 
+static void get_session_playlists(sp_playlistcontainer *pc,
+                                  struct evhttp_request *request,
+                                  void *userdata) {
+  json_t *json = json_object();
+  json_t *playlists = json_array();
+  json_object_set_new(json, "playlists", playlists);
+  int status = HTTP_OK;
+  char folder_name[256];
+
+  for (int i = 0; i < sp_playlistcontainer_num_playlists(pc); i++) {
+    sp_playlist *playlist = sp_playlistcontainer_playlist(pc, i);
+
+    if (!sp_playlist_is_loaded(playlist)) {
+      status = HTTP_PARTIAL;
+      continue;
+    }
+
+    sp_playlist_type playlist_type = sp_playlistcontainer_playlist_type(pc, i);
+
+    if(playlist_type == SP_PLAYLIST_TYPE_PLAYLIST){
+      json_t *playlist_json = json_object();
+      playlist_to_json(playlist, playlist_json);
+      json_array_append_new(playlists, playlist_json);
+    } else if(playlist_type == SP_PLAYLIST_TYPE_START_FOLDER || playlist_type == SP_PLAYLIST_TYPE_END_FOLDER){
+      if(playlist_type == SP_PLAYLIST_TYPE_START_FOLDER){
+        sp_playlistcontainer_playlist_folder_name(pc, i, folder_name, sizeof(folder_name));
+      }
+
+      json_t *folder_json = json_object();
+      folder_to_json(playlist, folder_json, playlist_type, folder_name);
+      json_array_append_new(playlists, folder_json);
+    }
+  }
+
+  send_reply_json(request, status, status == HTTP_OK ? "OK" : "Partial Content",
+                  json);
+}
+
 static void put_user_inbox(const char *user,
                            struct evhttp_request *request,
                            void *userdata) {
@@ -437,6 +475,58 @@ static void put_playlist(sp_playlist *playlist,
   } else {
     register_playlist_callbacks(playlist, request, &get_playlist,
                                 &playlist_state_changed_callbacks, NULL);
+  }
+}
+
+static void put_folder(struct evhttp_request *request,
+                       void *userdata) {
+  sp_session *session = userdata;
+  json_error_t loads_error;
+  json_t *playlist_json = read_request_body_json(request, &loads_error);
+
+  if (playlist_json == NULL) {
+    send_error(request, HTTP_BADREQUEST,
+               loads_error.text ? loads_error.text : "Unable to parse JSON");
+    return;
+  }
+
+  // Parse playlist
+  if (!json_is_object(playlist_json)) {
+    send_error(request, HTTP_BADREQUEST, "Invalid playlist object");
+    return;
+  }
+
+  // Get title
+  json_t *title_json = json_object_get(playlist_json, "title");
+
+  if (title_json == NULL) {
+    json_decref(playlist_json);
+    send_error(request, HTTP_BADREQUEST,
+               "Invalid folder: title is missing");
+    return;
+  }
+
+  if (!json_is_string(title_json)) {
+    json_decref(playlist_json);
+    send_error(request, HTTP_BADREQUEST,
+               "Invalid folder: title is not a string");
+    return;
+  }
+
+  char title[kMaxPlaylistTitleLength];
+  strncpy(title, json_string_value(title_json), kMaxPlaylistTitleLength);
+  json_decref(playlist_json);
+
+  // Add new playlist folder
+  sp_playlistcontainer *pc = sp_session_playlistcontainer(session);
+  sp_error error = sp_playlistcontainer_add_folder(pc, sp_playlistcontainer_num_playlists(pc), title);
+
+  if(error == SP_ERROR_OK){
+    json_t *json = json_object();
+    send_reply_json(request, HTTP_OK, "OK", json);
+  } else{
+    send_error(request, HTTP_ERROR, "");
+    return;
   }
 }
 
@@ -700,6 +790,35 @@ static void put_playlist_patch(sp_playlist *playlist,
                               &playlist_update_in_progress_callbacks, NULL);
 }
 
+static void move_session_playlist(sp_playlistcontainer *pc,
+                                  struct evhttp_request *request,
+                                  void *userdata) {
+  sp_session *session = userdata;
+  json_error_t loads_error;
+
+  const char *uri = evhttp_request_get_uri(request);
+  struct evkeyvalq query_fields;
+  evhttp_parse_query(uri, &query_fields);
+
+  const char *index_field = evhttp_find_header(&query_fields, "index");
+  int index;
+  sscanf(index_field, "%d", &index);
+
+  const char *new_position_field = evhttp_find_header(&query_fields, "new_position");
+  int new_position;
+  sscanf(new_position_field, "%d", &new_position);
+
+  sp_error error = sp_playlistcontainer_move_playlist(pc, index, new_position, false);
+
+  if(error == SP_ERROR_OK){
+    json_t *json = json_object();
+    send_reply_json(request, HTTP_OK, "OK", json);
+  } else{
+    send_error(request, HTTP_ERROR, "");
+    return;
+  }
+}
+
 static void handle_user_request(struct evhttp_request *request,
                                 char *action,
                                 const char *canonical_username,
@@ -743,6 +862,70 @@ static void handle_user_request(struct evhttp_request *request,
     case EVHTTP_REQ_POST:
       if (strncmp(action, "inbox", 5) == 0) {
         put_user_inbox(canonical_username, request, session);
+      }
+      break;
+
+    default:
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      break;
+  }
+}
+
+static void handle_folder_request(struct evhttp_request *request,
+                                  sp_session *session) {
+  int http_method = evhttp_request_get_command(request);
+
+  switch (http_method) {
+    case EVHTTP_REQ_PUT:
+    case EVHTTP_REQ_POST:
+      put_folder(request, session);
+      break;
+
+    default:
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      break;
+  }
+}
+
+static void handle_session_request(struct evhttp_request *request,
+                                   char *action,
+                                   sp_session *session) {
+  if (action == NULL) {
+    evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+    return;
+  }
+
+  int http_method = evhttp_request_get_command(request);
+
+  switch (http_method) {
+    case EVHTTP_REQ_GET:
+      if (strncmp(action, "playlists", 9) == 0) {
+        sp_playlistcontainer *pc = sp_session_playlistcontainer(session);
+
+        if (sp_playlistcontainer_is_loaded(pc)) {
+          get_session_playlists(pc, request, session);
+        } else {
+          register_playlistcontainer_callbacks(pc, request,
+              &get_session_playlists,
+              &playlistcontainer_loaded_callbacks,
+              session);
+        }
+      }
+      break;
+
+    case EVHTTP_REQ_PUT:
+    case EVHTTP_REQ_POST:
+      if (strncmp(action, "move-playlist", 13) == 0) {
+        sp_playlistcontainer *pc = sp_session_playlistcontainer(session);
+
+        if (sp_playlistcontainer_is_loaded(pc)) {
+          move_session_playlist(pc, request, session);
+        } else {
+          register_playlistcontainer_callbacks(pc, request,
+              &move_session_playlist,
+              &playlistcontainer_loaded_callbacks,
+              session);
+        }
       }
       break;
 
@@ -800,6 +983,15 @@ static void handle_request(struct evhttp_request *request,
     handle_user_request(request, action, username, session);
     free(uri);
     return;
+  }
+
+  if(strncmp(entity, "folder", 6) == 0){
+    handle_folder_request(request, session);
+  }
+
+  if(strncmp(entity, "session", 7) == 0){
+    char *action = strtok(NULL, "/");
+    handle_session_request(request, action, session);
   }
 
   // Handle requests to /playlist/<playlist_uri>/<action>

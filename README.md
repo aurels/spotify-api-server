@@ -19,6 +19,9 @@ and GPL.
     GET /user/{username}/playlists -> {playlists:[<playlist>]}
     GET /user/{username}/starred -> <playlist>
 
+    GET /session/playlists -> {playlists:[<playlist>]}
+    PUT /session/move-playlist?index&new_position -> {}
+
     GET /playlist/{uri} -> <playlist>
     GET /playlist/{uri}/collaborative -> {collaborative:<boolean>}
     GET /playlist/{uri}/subscribers -> [<string>]
@@ -30,6 +33,8 @@ and GPL.
     POST /playlist/{uri}/patch <- [<track URI>] -> <playlist>
 
     DELETE /playlist/{uri}/delete -> <playlist>
+
+    POST /folder <- {title:<string>} -> {}
 
 
 `patch` replaces all tracks in a playlist with as few `add`s and `remove`s as

@@ -94,6 +94,27 @@ json_t *playlist_to_json(sp_playlist *playlist, json_t *object) {
     sp_link_release(track_link);
   }
 
+  // Type
+  const char *type = "playlist";
+  json_object_set_new(object, "type",
+                      json_string_nocheck(type));
+
+  return object;
+}
+
+json_t *folder_to_json(sp_playlist *playlist, json_t *object, sp_playlist_type playlist_type, char *folder_name) {
+  assert(sp_playlist_is_loaded(playlist));
+
+  json_object_set_new(object, "title",
+                      json_string_nocheck(folder_name));
+
+  const char *type;
+  if(playlist_type == SP_PLAYLIST_TYPE_START_FOLDER) type = "folder-start";
+  else                                               type = "folder-end";
+
+  json_object_set_new(object, "type",
+                      json_string_nocheck(type));
+
   return object;
 }
 
